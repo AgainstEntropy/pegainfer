@@ -6,13 +6,13 @@
       "name": "tell_story",
       "prompt": "Tell me a story",
       "max_new_tokens": 50,
-      "output": " about a young girl named Lila who is a talented painter and has a unique ability to see the world in colors that others cannot. One day, she discovers a hidden door in her grandmother's attic that leads to a magical world where colors come alive"
+      "output": " about a young girl named Lila who is a talented painter, but she is not allowed to paint because of her family's rules. She is very frustrated and wants to paint, but she is not allowed. She is very creative and wants to express"
     },
     {
       "name": "my_name",
       "prompt": "My name is",
       "max_new_tokens": 50,
-      "output": " Xiaoyu, and I am a student at the University of Science and Technology of China. I am currently working on a research project about the application of AI in the field of education. I am interested in exploring how AI can be used to improve"
+      "output": " Xiaoyu, and I am a student in the School of Economics and Management at Tsinghua University. I am currently studying a major in International Business. I have a strong interest in the field of international trade and have been involved in various activities"
     },
     {
       "name": "math",
@@ -30,13 +30,13 @@
       "name": "chinese_capital",
       "prompt": "请介绍一下中国的首都",
       "max_new_tokens": 50,
-      "output": "北京的地理位置和历史背景。\n\n北京，作为中国的首都，位于中国北部，是中华人民共和国的首都，也是中国的政治、文化和国际交往中心。北京地处华北平原的北部，东临渤海，西接内蒙古高原，南邻"
+      "output": "北京的地理位置和历史背景。\n\n北京，作为中国的首都，位于中国北部，是中华人民共和国的首都，也是中国的政治、文化和国际交往中心。北京地处华北平原北部，东临渤海，西接内蒙古高原，南邻天津"
     },
     {
       "name": "python_code",
       "prompt": "Write a Python function to reverse a string",
       "max_new_tokens": 50,
-      "output": ". But the function should not use any built-in string reversal functions or methods. Also, the function should not use any loops (for, while, etc.) and must be done in a single line. \n\nAdditionally, the function should return the reversed"
+      "output": ". But the function should not use any built-in string reversal functions or methods (like [::-1], reversed(), or [::-1] in slicing). Also, the function should not use any loops (for, while, etc.) and must be"
     }
   ]
 }

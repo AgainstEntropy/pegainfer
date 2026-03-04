@@ -1,10 +1,15 @@
 #include "common.cuh"
 
+// ============================================================================
+// Phase 1: Gate + Up projection (interleaved) → SiLU activation
+// Computes act[i] = silu(gate_proj[i] @ x) * (up_proj[i] @ x)
+// BF16×4 vectorized loads, warp shuffle reduction.
+// Gate and up share the same x vector — read x once per pass.
+// ============================================================================
 #define FUSED_MLP_TILE 256
 #define FUSED_MLP_INTER_PER_BLOCK 4
+#define MLP_NUM_WARPS (FUSED_MLP_TILE / WARP_SIZE)
 
-// Phase 1: Compute gate, up, and activation
-// Each block handles FUSED_MLP_INTER_PER_BLOCK intermediate dimensions
 __global__ void fused_mlp_intermediate_kernel(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ gate_proj,
@@ -15,95 +20,126 @@ __global__ void fused_mlp_intermediate_kernel(
 
   int inter_base = blockIdx.x * FUSED_MLP_INTER_PER_BLOCK;
   int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
 
-  __shared__ float gate_acc[FUSED_MLP_INTER_PER_BLOCK];
-  __shared__ float up_acc[FUSED_MLP_INTER_PER_BLOCK];
-  __shared__ float tile_red[FUSED_MLP_INTER_PER_BLOCK][FUSED_MLP_TILE];
+  int K4 = hidden_size / 4;
+  int K_tail = hidden_size - K4 * 4;
 
-  // Compute gate projections for this block
+  const uint2 *x_vec = reinterpret_cast<const uint2 *>(x);
+
+  // Interleaved gate + up: compute both dot products in one pass over x
+  float gate_sums[FUSED_MLP_INTER_PER_BLOCK];
+  float up_sums[FUSED_MLP_INTER_PER_BLOCK];
+
+  #pragma unroll
+  for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
+    gate_sums[r] = 0.0f;
+    up_sums[r] = 0.0f;
+  }
+
+  #pragma unroll
   for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
     int inter_idx = inter_base + r;
     if (inter_idx >= intermediate_size) break;
 
-    float sum = 0.0f;
-    const __nv_bfloat16 *gate_row = gate_proj + inter_idx * hidden_size;
+    const uint2 *gate_row_vec = reinterpret_cast<const uint2 *>(gate_proj + inter_idx * hidden_size);
+    const uint2 *up_row_vec = reinterpret_cast<const uint2 *>(up_proj + inter_idx * hidden_size);
+    float g_sum = 0.0f;
+    float u_sum = 0.0f;
 
-    for (int i = tid; i < hidden_size; i += FUSED_MLP_TILE) {
-      sum += __bfloat162float(gate_row[i]) * __bfloat162float(x[i]);
+    for (int k4 = tid; k4 < K4; k4 += FUSED_MLP_TILE) {
+      uint2 x_val = x_vec[k4];
+      uint2 g_val = gate_row_vec[k4];
+      uint2 u_val = up_row_vec[k4];
+
+      __nv_bfloat162 x_lo = *reinterpret_cast<__nv_bfloat162 *>(&x_val.x);
+      __nv_bfloat162 x_hi = *reinterpret_cast<__nv_bfloat162 *>(&x_val.y);
+      __nv_bfloat162 g_lo = *reinterpret_cast<__nv_bfloat162 *>(&g_val.x);
+      __nv_bfloat162 g_hi = *reinterpret_cast<__nv_bfloat162 *>(&g_val.y);
+      __nv_bfloat162 u_lo = *reinterpret_cast<__nv_bfloat162 *>(&u_val.x);
+      __nv_bfloat162 u_hi = *reinterpret_cast<__nv_bfloat162 *>(&u_val.y);
+
+      g_sum += __bfloat162float(g_lo.x) * __bfloat162float(x_lo.x);
+      g_sum += __bfloat162float(g_lo.y) * __bfloat162float(x_lo.y);
+      g_sum += __bfloat162float(g_hi.x) * __bfloat162float(x_hi.x);
+      g_sum += __bfloat162float(g_hi.y) * __bfloat162float(x_hi.y);
+
+      u_sum += __bfloat162float(u_lo.x) * __bfloat162float(x_lo.x);
+      u_sum += __bfloat162float(u_lo.y) * __bfloat162float(x_lo.y);
+      u_sum += __bfloat162float(u_hi.x) * __bfloat162float(x_hi.x);
+      u_sum += __bfloat162float(u_hi.y) * __bfloat162float(x_hi.y);
     }
-    tile_red[r][tid] = sum;
-  }
-  __syncthreads();
 
-  // Reduce gate
-  for (int stride = FUSED_MLP_TILE / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
-        tile_red[r][tid] += tile_red[r][tid + stride];
+    // Scalar tail
+    if (K_tail > 0) {
+      const __nv_bfloat16 *gate_row = gate_proj + inter_idx * hidden_size;
+      const __nv_bfloat16 *up_row = up_proj + inter_idx * hidden_size;
+      int k_start = K4 * 4;
+      for (int k = k_start + tid; k < hidden_size; k += FUSED_MLP_TILE) {
+        float xv = __bfloat162float(x[k]);
+        g_sum += __bfloat162float(gate_row[k]) * xv;
+        u_sum += __bfloat162float(up_row[k]) * xv;
       }
     }
-    __syncthreads();
+
+    gate_sums[r] = g_sum;
+    up_sums[r] = u_sum;
   }
 
-  if (tid == 0) {
-    for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
-      gate_acc[r] = tile_red[r][0];
-    }
-  }
-  __syncthreads();
-
-  // Compute up projections
+  // Warp-level reduction
+  #pragma unroll
   for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
-    int inter_idx = inter_base + r;
-    if (inter_idx >= intermediate_size) break;
-
-    float sum = 0.0f;
-    const __nv_bfloat16 *up_row = up_proj + inter_idx * hidden_size;
-
-    for (int i = tid; i < hidden_size; i += FUSED_MLP_TILE) {
-      sum += __bfloat162float(up_row[i]) * __bfloat162float(x[i]);
-    }
-    tile_red[r][tid] = sum;
-  }
-  __syncthreads();
-
-  // Reduce up
-  for (int stride = FUSED_MLP_TILE / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
-        tile_red[r][tid] += tile_red[r][tid + stride];
-      }
-    }
-    __syncthreads();
+    gate_sums[r] = warp_reduce_sum(gate_sums[r]);
+    up_sums[r] = warp_reduce_sum(up_sums[r]);
   }
 
-  if (tid == 0) {
+  // Inter-warp reduction via shared memory
+  __shared__ float warp_gate[FUSED_MLP_INTER_PER_BLOCK][MLP_NUM_WARPS];
+  __shared__ float warp_up[FUSED_MLP_INTER_PER_BLOCK][MLP_NUM_WARPS];
+
+  if (lane_id == 0) {
+    #pragma unroll
     for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
-      up_acc[r] = tile_red[r][0];
+      warp_gate[r][warp_id] = gate_sums[r];
+      warp_up[r][warp_id] = up_sums[r];
     }
   }
   __syncthreads();
 
-  // Compute SiLU(gate) * up and write activation
-  if (tid == 0) {
+  // First warp reduces across all warps and writes activation
+  if (warp_id == 0) {
+    #pragma unroll
     for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
-      int inter_idx = inter_base + r;
-      if (inter_idx < intermediate_size) {
-        // Match HF: GEMV outputs are bf16, silu output is bf16, then bf16 × bf16
-        __nv_bfloat16 gate_bf16 = __float2bfloat16(gate_acc[r]);
-        float g = __bfloat162float(gate_bf16);
-        float silu_g = g / (1.0f + expf(-g));
-        __nv_bfloat16 silu_bf16 = __float2bfloat16(silu_g);
-        __nv_bfloat16 up_bf16 = __float2bfloat16(up_acc[r]);
-        float result = __bfloat162float(silu_bf16) * __bfloat162float(up_bf16);
-        act[inter_idx] = __float2bfloat16(result);
+      float g = (lane_id < MLP_NUM_WARPS) ? warp_gate[r][lane_id] : 0.0f;
+      float u = (lane_id < MLP_NUM_WARPS) ? warp_up[r][lane_id] : 0.0f;
+      g = warp_reduce_sum(g);
+      u = warp_reduce_sum(u);
+
+      if (lane_id == 0) {
+        int inter_idx = inter_base + r;
+        if (inter_idx < intermediate_size) {
+          // Match HF: GEMV outputs are bf16, silu output is bf16, then bf16 × bf16
+          __nv_bfloat16 gate_bf16 = __float2bfloat16(g);
+          float gf = __bfloat162float(gate_bf16);
+          float silu_g = gf / (1.0f + expf(-gf));
+          __nv_bfloat16 silu_bf16 = __float2bfloat16(silu_g);
+          __nv_bfloat16 up_bf16 = __float2bfloat16(u);
+          float result = __bfloat162float(silu_bf16) * __bfloat162float(up_bf16);
+          act[inter_idx] = __float2bfloat16(result);
+        }
       }
     }
   }
 }
 
-// Phase 2: Down projection (out = down_proj @ act)
-#define FUSED_MLP_OUT_PER_BLOCK 4
+// ============================================================================
+// Phase 2: Down projection — out = down_proj @ act
+// Register accumulation across all K (single final reduction).
+// BF16×4 vectorized loads, warp shuffle reduction.
+// OUT_PER_BLOCK=8: each block processes 8 output rows.
+// ============================================================================
+#define FUSED_MLP_OUT_PER_BLOCK 8
 
 __global__ void fused_mlp_output_kernel(
     const __nv_bfloat16 *__restrict__ act,
@@ -114,47 +150,82 @@ __global__ void fused_mlp_output_kernel(
 
   int out_base = blockIdx.x * FUSED_MLP_OUT_PER_BLOCK;
   int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
 
-  __shared__ float tile_red[FUSED_MLP_OUT_PER_BLOCK][FUSED_MLP_TILE];
-  float acc[FUSED_MLP_OUT_PER_BLOCK] = {0.0f, 0.0f, 0.0f, 0.0f};
+  int K4 = intermediate_size / 4;
+  int K_tail = intermediate_size - K4 * 4;
 
-  for (int k0 = 0; k0 < intermediate_size; k0 += FUSED_MLP_TILE) {
-    int k = k0 + tid;
-    float act_val = (k < intermediate_size) ? __bfloat162float(act[k]) : 0.0f;
+  const uint2 *act_vec = reinterpret_cast<const uint2 *>(act);
 
-    for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
-      int row = out_base + r;
-      float contrib = 0.0f;
-      if (row < hidden_size && k < intermediate_size) {
-        contrib = __bfloat162float(down_proj[row * intermediate_size + k]) * act_val;
-      }
-      tile_red[r][tid] = contrib;
+  // Register accumulation: each thread accumulates across all K
+  float acc[FUSED_MLP_OUT_PER_BLOCK];
+  #pragma unroll
+  for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) acc[r] = 0.0f;
+
+  #pragma unroll
+  for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
+    int row = out_base + r;
+    if (row >= hidden_size) break;
+
+    const uint2 *dp_row_vec = reinterpret_cast<const uint2 *>(down_proj + row * intermediate_size);
+    float sum = 0.0f;
+
+    for (int k4 = tid; k4 < K4; k4 += FUSED_MLP_TILE) {
+      uint2 a_val = act_vec[k4];
+      uint2 d_val = dp_row_vec[k4];
+
+      __nv_bfloat162 a_lo = *reinterpret_cast<__nv_bfloat162 *>(&a_val.x);
+      __nv_bfloat162 a_hi = *reinterpret_cast<__nv_bfloat162 *>(&a_val.y);
+      __nv_bfloat162 d_lo = *reinterpret_cast<__nv_bfloat162 *>(&d_val.x);
+      __nv_bfloat162 d_hi = *reinterpret_cast<__nv_bfloat162 *>(&d_val.y);
+
+      sum += __bfloat162float(d_lo.x) * __bfloat162float(a_lo.x);
+      sum += __bfloat162float(d_lo.y) * __bfloat162float(a_lo.y);
+      sum += __bfloat162float(d_hi.x) * __bfloat162float(a_hi.x);
+      sum += __bfloat162float(d_hi.y) * __bfloat162float(a_hi.y);
     }
-    __syncthreads();
 
-    // Reduce
-    for (int stride = FUSED_MLP_TILE / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
-          tile_red[r][tid] += tile_red[r][tid + stride];
-        }
-      }
-      __syncthreads();
-    }
-
-    if (tid == 0) {
-      for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
-        acc[r] += tile_red[r][0];
+    // Scalar tail
+    if (K_tail > 0) {
+      const __nv_bfloat16 *dp_row = down_proj + row * intermediate_size;
+      int k_start = K4 * 4;
+      for (int k = k_start + tid; k < intermediate_size; k += FUSED_MLP_TILE) {
+        sum += __bfloat162float(dp_row[k]) * __bfloat162float(act[k]);
       }
     }
-    __syncthreads();
+
+    acc[r] = sum;
   }
 
-  if (tid == 0) {
+  // Warp-level reduction
+  #pragma unroll
+  for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
+    acc[r] = warp_reduce_sum(acc[r]);
+  }
+
+  // Inter-warp reduction via shared memory
+  __shared__ float warp_sums[FUSED_MLP_OUT_PER_BLOCK][MLP_NUM_WARPS];
+
+  if (lane_id == 0) {
+    #pragma unroll
     for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
-      int row = out_base + r;
-      if (row < hidden_size) {
-        out[row] = __float2bfloat16(acc[r]);
+      warp_sums[r][warp_id] = acc[r];
+    }
+  }
+  __syncthreads();
+
+  // First warp reduces across all warps and writes output
+  if (warp_id == 0) {
+    #pragma unroll
+    for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
+      float val = (lane_id < MLP_NUM_WARPS) ? warp_sums[r][lane_id] : 0.0f;
+      val = warp_reduce_sum(val);
+      if (lane_id == 0) {
+        int row = out_base + r;
+        if (row < hidden_size) {
+          out[row] = __float2bfloat16(val);
+        }
       }
     }
   }
