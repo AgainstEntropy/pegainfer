@@ -4,12 +4,14 @@
 // ============================================================================
 // Hand-written GEMV: y = A @ x (row-major matrix)
 // Each block processes GEMV_ROWS_PER_BLOCK rows.
-// 256 threads stride over K, shared-memory reduction to final dot product.
+// BF16×4 vectorized loads (8 bytes/thread/stride) for memory throughput.
+// Warp shuffle reduction + shared memory for inter-warp reduce.
 // BF16 inputs, FP32 accumulators, BF16 output.
 // Graph-capture safe (no cuBLAS workspace allocation).
 // ============================================================================
 #define GEMV_BLOCK 256
 #define GEMV_ROWS_PER_BLOCK 4
+#define GEMV_NUM_WARPS (GEMV_BLOCK / WARP_SIZE)
 
 __global__ void gemv_handwritten_kernel(
     const __nv_bfloat16 *__restrict__ A, // (M, K) row-major
@@ -19,42 +21,83 @@ __global__ void gemv_handwritten_kernel(
 
   int row_base = blockIdx.x * GEMV_ROWS_PER_BLOCK;
   int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
 
-  __shared__ float tile_red[GEMV_ROWS_PER_BLOCK][GEMV_BLOCK];
+  // Vectorized BF16×4 path: process 4 elements per load
+  int K4 = K / 4;  // number of bf16x4 groups
+  int K_tail = K - K4 * 4;  // remainder for scalar fallback
 
-  // Each thread accumulates partial dot products for GEMV_ROWS_PER_BLOCK rows
+  float sums[GEMV_ROWS_PER_BLOCK];
+  #pragma unroll
+  for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) sums[r] = 0.0f;
+
+  // Cast to uint2 for 8-byte aligned loads (4× bf16)
+  const uint2 *x_vec = reinterpret_cast<const uint2 *>(x);
+
   #pragma unroll
   for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
     int row = row_base + r;
-    float sum = 0.0f;
     if (row < M) {
-      const __nv_bfloat16 *A_row = A + row * K;
-      for (int k = tid; k < K; k += GEMV_BLOCK) {
-        sum += __bfloat162float(A_row[k]) * __bfloat162float(x[k]);
+      const uint2 *A_row_vec = reinterpret_cast<const uint2 *>(A + row * K);
+      float sum = 0.0f;
+
+      // Main vectorized loop: 4 bf16 elements per iteration
+      for (int k4 = tid; k4 < K4; k4 += GEMV_BLOCK) {
+        uint2 a_val = A_row_vec[k4];
+        uint2 x_val = x_vec[k4];
+        // Unpack 4× bf16 from two uint32
+        __nv_bfloat162 a_lo = *reinterpret_cast<__nv_bfloat162 *>(&a_val.x);
+        __nv_bfloat162 a_hi = *reinterpret_cast<__nv_bfloat162 *>(&a_val.y);
+        __nv_bfloat162 x_lo = *reinterpret_cast<__nv_bfloat162 *>(&x_val.x);
+        __nv_bfloat162 x_hi = *reinterpret_cast<__nv_bfloat162 *>(&x_val.y);
+        sum += __bfloat162float(a_lo.x) * __bfloat162float(x_lo.x);
+        sum += __bfloat162float(a_lo.y) * __bfloat162float(x_lo.y);
+        sum += __bfloat162float(a_hi.x) * __bfloat162float(x_hi.x);
+        sum += __bfloat162float(a_hi.y) * __bfloat162float(x_hi.y);
       }
+
+      // Scalar tail for K not divisible by 4
+      if (K_tail > 0) {
+        const __nv_bfloat16 *A_row = A + row * K;
+        int k_start = K4 * 4;
+        for (int k = k_start + tid; k < K; k += GEMV_BLOCK) {
+          sum += __bfloat162float(A_row[k]) * __bfloat162float(x[k]);
+        }
+      }
+
+      sums[r] = sum;
     }
-    tile_red[r][tid] = sum;
+  }
+
+  // Warp-level reduction via shuffle
+  #pragma unroll
+  for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
+    sums[r] = warp_reduce_sum(sums[r]);
+  }
+
+  // Inter-warp reduction via shared memory
+  __shared__ float warp_sums[GEMV_ROWS_PER_BLOCK][GEMV_NUM_WARPS];
+
+  if (lane_id == 0) {
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
+      warp_sums[r][warp_id] = sums[r];
+    }
   }
   __syncthreads();
 
-  // Shared memory reduction
-  for (int stride = GEMV_BLOCK / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      #pragma unroll
-      for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
-        tile_red[r][tid] += tile_red[r][tid + stride];
-      }
-    }
-    __syncthreads();
-  }
-
-  // Thread 0 writes final results
-  if (tid == 0) {
+  // First warp reduces across all warps
+  if (warp_id == 0) {
     #pragma unroll
     for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
-      int row = row_base + r;
-      if (row < M) {
-        y[row] = __float2bfloat16(tile_red[r][0]);
+      float val = (lane_id < GEMV_NUM_WARPS) ? warp_sums[r][lane_id] : 0.0f;
+      val = warp_reduce_sum(val);
+      if (lane_id == 0) {
+        int row = row_base + r;
+        if (row < M) {
+          y[row] = __float2bfloat16(val);
+        }
       }
     }
   }
